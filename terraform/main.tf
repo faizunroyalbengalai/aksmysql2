@@ -98,6 +98,11 @@ variable "db_password" {
 locals {
   name_safe = substr(lower(replace(replace(var.project_name, "_", "-"), " ", "-")), 0, 24)
   namespace = local.name_safe
+  effective_db_region    = var.azure_db_region != "" ? var.azure_db_region : var.azure_region
+  db_is_cross_region     = var.azure_db_region != "" && var.azure_db_region != var.azure_region
+  _db_name               = var.db_name != "" ? var.db_name : "${replace(var.project_name, "-", "_")}db"
+  _db_port               = "3306"
+  _db_scheme             = "mysql"
 }
 
 resource "azurerm_resource_group" "rg" {
@@ -109,6 +114,19 @@ resource "azurerm_resource_group" "rg" {
   }
 }
 
+resource "azurerm_resource_group" "db_rg" {
+  count    = local.db_is_cross_region ? 1 : 0
+  name     = "${var.project_name}-db-rg"
+  location = var.azure_db_region
+  tags = {
+    Project   = var.project_name
+    ManagedBy = "udap"
+  }
+}
+
+locals {
+  db_resource_group_name = local.db_is_cross_region ? azurerm_resource_group.db_rg[0].name : azurerm_resource_group.rg.name
+}
 
 resource "azurerm_kubernetes_cluster" "aks" {
   name                = "${var.project_name}-aks"
@@ -143,6 +161,43 @@ resource "azurerm_kubernetes_cluster" "aks" {
   }
 }
 
+resource "azurerm_mysql_flexible_server" "db" {
+  name                   = "${var.project_name}-db"
+  resource_group_name    = local.db_resource_group_name
+  location               = local.effective_db_region
+  version                = "8.0.21"
+  administrator_login    = var.db_username != "" ? var.db_username : "appuser"
+  administrator_password = var.db_password
+  zone                   = "1"
+  sku_name               = "B_Standard_B1ms"
+  # MySQL Flexible Server computes public_network_access_enabled itself based
+  # on whether delegated_subnet_id is set — declaring it explicitly fails with
+  # "Value for unconfigurable attribute". We have no delegated subnet here, so
+  # Azure auto-sets it to true (public reachable from app container).
+  storage {
+    size_gb = 20
+  }
+  tags = {
+    Project   = var.project_name
+    ManagedBy = "udap"
+  }
+}
+
+resource "azurerm_mysql_flexible_server_firewall_rule" "allow_azure" {
+  name                = "allow-azure-services"
+  resource_group_name = local.db_resource_group_name
+  server_name         = azurerm_mysql_flexible_server.db.name
+  start_ip_address    = "0.0.0.0"
+  end_ip_address      = "0.0.0.0"
+}
+
+resource "azurerm_mysql_flexible_database" "appdb" {
+  name                = local._db_name
+  resource_group_name = local.db_resource_group_name
+  server_name         = azurerm_mysql_flexible_server.db.name
+  charset             = "utf8mb4"
+  collation           = "utf8mb4_unicode_ci"
+}
 
 output "cluster_name" {
   value = azurerm_kubernetes_cluster.aks.name
@@ -160,3 +215,19 @@ output "app_port" {
   value = var.app_port
 }
 
+output "db_host" {
+  value = azurerm_mysql_flexible_server.db.fqdn
+}
+
+output "db_port" {
+  value = local._db_port
+}
+
+output "db_name" {
+  value = local._db_name
+}
+
+output "db_username" {
+  value     = var.db_username
+  sensitive = true
+}
